@@ -1,8 +1,10 @@
 """
 title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
-author: Thomas Friedel
-version: 0.1
+author: Thomas Friedel, Denis Kutuzov (aka R8CEH)
+author_url: https://github.com/tfriedel/openwebui-claude-code
+funding_url: https://github.com/R8CEH/openwebui-claude-code
+version: 0.2.0
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -36,11 +38,39 @@ _DOWNLOAD_EXTENSIONS = {
     ".docx",
     ".pptx",
     ".zip",
+    ".py",
+    ".js",
+    ".ts",
+    ".sh",
+    ".rs",
+    ".go",
+    ".cpp",
+    ".c",
+    ".h",
 }
+
+_EXT_TO_LANG = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".sh": "bash",
+    ".rs": "rust",
+    ".go": "go",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".h": "c",
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".html": "html",
+    ".css": "css",
+    ".md": "markdown",
+    ".sql": "sql",
+    ".toml": "toml",
+    ".xml": "xml",
+}
+
 _ARTIFACT_EXTENSIONS = _IMAGE_EXTENSIONS | _DOWNLOAD_EXTENSIONS
-# Safety cap to avoid uploading runaway files. Uploaded artifacts are served
-# via OpenWebUI's file endpoint, so they don't bloat the chat history even
-# when large — this is only a "don't accidentally ship a DVD ISO" guard.
 _MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MiB
 
 from claude_agent_sdk import (
@@ -59,9 +89,51 @@ from claude_agent_sdk import (
 
 log = logging.getLogger(__name__)
 
-# OpenWebUI calls pipe() fresh for each chat turn. We keep a chat_id -> session_id
-# map in-process so follow-up turns resume the same Claude Code session.
 _chat_sessions: Dict[str, str] = {}
+_chat_workdirs: Dict[str, str] = {}
+
+
+async def _emit_project_name(prompt: str, event_emitter: Optional[Callable]) -> str:
+    """Извлекает название проекта из промпта или генерирует из ключевых слов."""
+    explicit = re.search(
+        r'(?:назов[её]м|название|named?|call(?:\s+it)?|project)\s+["\']?([A-Za-z0-9][A-Za-z0-9_\-]{1,30})["\']?',
+        prompt,
+        re.IGNORECASE,
+    )
+    if explicit:
+        name = explicit.group(1)
+    else:
+        words = re.findall(r"[A-Za-z]{3,}", prompt)
+        meaningful = [
+            w.capitalize()
+            for w in words
+            if w.lower()
+            not in {
+                "the",
+                "and",
+                "for",
+                "with",
+                "from",
+                "that",
+                "this",
+                "let",
+                "make",
+                "create",
+                "write",
+                "simple",
+                "just",
+            }
+        ][:3]
+        name = "_".join(meaningful) or "Project"
+
+    if event_emitter:
+        try:
+            await event_emitter(
+                {"type": "chat:title", "data": {"title": name.replace("_", " ")}}
+            )
+        except Exception:
+            pass
+    return name
 
 
 _TOOL_PREVIEW_FIELDS = {
@@ -85,8 +157,6 @@ def _tool_preview(name: str, tool_input: Dict[str, Any]) -> str:
         raw = ", ".join(f"{k}={str(v)[:40]}" for k, v in list(tool_input.items())[:2])
     else:
         return ""
-    # Collapse to one line — multi-line values break inline-code spans and leak
-    # "# python comments" into markdown as H1 headings.
     first = raw.split("\n", 1)[0]
     truncated = first if len(first) <= 120 else first[:117] + "…"
     return truncated + (" …" if "\n" in raw and not truncated.endswith("…") else "")
@@ -102,16 +172,24 @@ _FENCE_LANG_PER_TOOL = {
 
 
 def _tool_input_block(name: str, tool_input: Dict[str, Any]) -> str:
-    """Full tool invocation as fenced code block(s). If the tool has a known
-    primary field (Bash→command, Read→file_path, …), render that with the
-    right syntax highlight and append any other fields as a small JSON block.
-    Tools with no known primary render as a single JSON block.
-    """
     if not tool_input:
         return "```\n(no input)\n```"
     primary = _TOOL_PREVIEW_FIELDS.get(name)
     if primary and primary in tool_input:
         lang = _FENCE_LANG_PER_TOOL.get(name, "text")
+
+        if name in ("Write", "Edit") and "content" in tool_input:
+            file_path = tool_input.get(primary, "")
+            ext = Path(file_path).suffix.lower()
+            code_lang = _EXT_TO_LANG.get(ext, "text")
+            content = tool_input["content"]
+            display_path = (
+                "/".join(Path(file_path).parts[-2:])
+                if len(Path(file_path).parts) >= 2
+                else file_path
+            )
+            return f"`{display_path}`\n\n```{code_lang}\n{content}\n```"
+
         parts = [f"```{lang}\n{tool_input[primary]}\n```"]
         others = {k: v for k, v in tool_input.items() if k != primary}
         if others:
@@ -140,17 +218,10 @@ def _format_tool_result(content: Any) -> str:
 
 
 def _iter_artifact_files(scan_dirs: List[Path]) -> "list[Path]":
-    """Yield image/document artifacts from each scan dir. Workdir is searched
-    recursively; other dirs (typically /tmp) are searched non-recursively to
-    avoid picking up unrelated files under nested system caches."""
     seen: List[Path] = []
-    for idx, root in enumerate(scan_dirs):
-        if not root.exists():
-            continue
-        iterator = root.rglob("*") if idx == 0 else root.iterdir()
-        for path in iterator:
-            if path.is_file() and path.suffix.lower() in _ARTIFACT_EXTENSIONS:
-                seen.append(path)
+    for path in scan_dirs[0].iterdir():
+        if path.is_file() and path.suffix.lower() in _ARTIFACT_EXTENSIONS:
+            seen.append(path)
     return seen
 
 
@@ -164,29 +235,11 @@ def _snapshot_artifacts(scan_dirs: List[Path]) -> Dict[str, int]:
     return snapshot
 
 
-def _inline_new_artifacts(
+async def _inline_new_artifacts(
     scan_dirs: List[Path],
     before: Dict[str, int],
     user_id: Optional[str],
 ) -> List[str]:
-    """Upload artifacts new or modified since `before` to OpenWebUI's file
-    store, and return markdown referencing the served URLs.
-
-    Why not base64 data URIs: large blobs (multi-MB PDFs) encoded as
-    `data:application/pdf;base64,…` in a markdown link cause browsers to spam
-    the address bar and stall when clicked. They'd also persist in chat
-    history, bloating the DB on every turn.
-
-    URL shape: `/api/v1/files/{id}/content` for every artifact.
-      - Images: loaded by the markdown `<img>` tag → display inline.
-      - PDFs: the route emits `Content-Disposition: inline` → browser opens
-        them in its native PDF viewer (new tab).
-      - Everything else: the route falls back to `attachment`, so clicking
-        triggers a download (fine for CSV/XLSX/ZIP — they have no sensible
-        inline view anyway).
-    Deliberately avoids `/content/{filename}`, which hard-codes `attachment`
-    for every type and so forces a download even for PDFs.
-    """
     if not user_id:
         return ["\n\n_(Can't save artifacts: no user context.)_\n"]
     try:
@@ -203,7 +256,7 @@ def _inline_new_artifacts(
         except OSError:
             continue
         if before.get(str(path)) == mtime:
-            continue  # untouched
+            continue
         if size > _MAX_ARTIFACT_BYTES:
             chunks.append(
                 f"\n\n_(Skipped {path.name}: {size // 1024 // 1024} MiB exceeds {_MAX_ARTIFACT_BYTES // 1024 // 1024} MiB limit.)_\n"
@@ -234,7 +287,7 @@ def _inline_new_artifacts(
             continue
 
         try:
-            Files.insert_new_file(
+            await Files.insert_new_file(
                 user_id,
                 FileForm(
                     id=file_id,
@@ -249,7 +302,7 @@ def _inline_new_artifacts(
                 ),
             )
         except Exception as exc:
-            log.exception("Artifact DB row failed: %s", path)
+            log.warning("DB insert FAILED: %s -> %s", path.name, exc)
             chunks.append(f"\n\n_(Saved but not linkable: {path.name}: {exc})_\n")
             continue
 
@@ -264,9 +317,6 @@ def _inline_new_artifacts(
 
 
 def _extract_system_prompt(body: Dict[str, Any]) -> Optional[str]:
-    """Collect `role=system` content from body.messages. OpenWebUI merges the
-    Workspace Model's configured system prompt into messages[0] before the
-    pipe is called (payload.py:apply_system_prompt_to_body)."""
     parts: List[str] = []
     for msg in body.get("messages") or []:
         if msg.get("role") != "system":
@@ -286,17 +336,6 @@ def _knowledge_collections(
     metadata: Optional[Dict[str, Any]],
     files: Optional[List[Dict[str, Any]]],
 ) -> List[Dict[str, str]]:
-    """Extract attached knowledge collections.
-
-    Priority order:
-    1. `metadata["model"]["info"]["meta"]["knowledge"]` — the authoritative
-       Workspace Model config, populated regardless of the `function_calling`
-       gate. This is the only source that works when the Workspace Model
-       sets `function_calling=native` (which disables OpenWebUI's auto-RAG).
-    2. `files` (__files__) — populated by the middleware's auto-RAG branch
-       when `function_calling != "native"`. Useful for non-native chats or
-       as a fallback.
-    """
     out: List[Dict[str, str]] = []
     seen: set = set()
 
@@ -310,10 +349,7 @@ def _knowledge_collections(
         out.append({"id": cid, "name": str(name or cid)})
 
     def _consume(item: Dict[str, Any]) -> None:
-        """Mirror OpenWebUI's vector-collection naming
-        (retrieval/utils.py:get_sources_from_items)."""
         name = item.get("name")
-        # Old-style: explicit collection_name(s). Legacy KBs with multiple colls.
         if item.get("collection_name"):
             _add(item["collection_name"], name)
             return
@@ -321,12 +357,10 @@ def _knowledge_collections(
             for coll in item["collection_names"]:
                 _add(coll, name)
             return
-        # Modern: collection name derived from the knowledge row's id.
         item_type = item.get("type")
         if item_type == "collection" and item.get("id"):
             _add(item["id"], name)
         elif item_type == "file" and item.get("id"):
-            # legacy single-file entries skip the prefix; modern ones prepend "file-".
             coll = item["id"] if item.get("legacy") else f"file-{item['id']}"
             _add(coll, name)
 
@@ -345,10 +379,6 @@ def _knowledge_collections(
 
 
 def _knowledge_row_ids(metadata: Optional[Dict[str, Any]]) -> List[str]:
-    """Return knowledge-table row ids for the attached Workspace-Model KBs.
-    These are the IDs used to look up files via Knowledges.get_files_by_id().
-    Only populated for `type: "collection"` entries — single-file entries
-    aren't exposed to list/read/grep (search still works for those)."""
     ids: List[str] = []
     model_knowledge = ((metadata or {}).get("model") or {}).get("info", {}).get(
         "meta", {}
@@ -369,17 +399,8 @@ def _build_kb_mcp_server(
     user_dict: Optional[Dict[str, Any]] = None,
     event_emitter: Optional[Callable] = None,
 ):
-    """Return (mcp_config, tool_names) for a knowledge-base search tool Claude
-    can invoke, or (None, []) if no KBs are attached.
-
-    Result formatting follows OpenWebUI's native RAG shape (<source id=N ...>
-    tags + citation event), so Claude's replies render with inline [N]
-    citations and populate the sources side-panel. Access control is
-    enforced implicitly: the closure captures only the collection_names
-    that OpenWebUI's middleware already filtered by the user's grants.
-    """
     if not knowledge:
-        return None, []
+        return None, [], {}
 
     collection_names = [k["id"] for k in knowledge]
     display = ", ".join(k["name"] for k in knowledge)
@@ -413,16 +434,12 @@ def _build_kb_mcp_server(
                     {"type": "text", "text": "Empty query — nothing to search."}
                 ]
             }
-        # Default to OpenWebUI's configured RAG_TOP_K so the tool respects the
-        # admin's retrieval setting. Fall back to 5 if unreadable.
         try:
             default_top_k = int(app.state.config.RAG_TOP_K.value)
         except Exception:
             default_top_k = 5
         top_k = int(args.get("top_k") or default_top_k)
 
-        # Resolve a proper UserModel so embedding_function can attribute
-        # usage / rate-limits per user (some backends require it).
         user_obj = None
         user_id = (user_dict or {}).get("id")
         if user_id:
@@ -472,10 +489,6 @@ def _build_kb_mcp_server(
                 ]
             }
 
-        # Surface citations in OpenWebUI's sources side-panel.
-        # Emit one event per document so each source gets its own filename label
-        # (a single event with a shared source.name collapses all sources into
-        # one label in the UI).
         if event_emitter:
             dist_iter = dists or [None] * len(metas)
             for doc, meta, dist in zip(docs, metas, dist_iter):
@@ -510,7 +523,6 @@ def _build_kb_mcp_server(
                 except Exception:
                     pass
 
-        # XML <source> tags = OpenWebUI's native RAG format → renders as [N] citations.
         parts = [f"Found {len(docs)} passage(s) for {query!r}:\n"]
         for i, (doc, meta) in enumerate(zip(docs, metas), 1):
             meta = meta or {}
@@ -523,9 +535,6 @@ def _build_kb_mcp_server(
         )
         return {"content": [{"type": "text", "text": "\n\n".join(parts)}]}
 
-    # ---------- Agentic helpers: list / read / grep ---------------------------
-    # Scoped to `knowledge_row_ids` (type=collection entries only). Single-file
-    # KBs (type=file) are searchable but not listable/readable by these tools.
     kb_ids: List[str] = list(knowledge_row_ids or [])
 
     async def _iter_scoped_files():
@@ -546,13 +555,11 @@ def _build_kb_mcp_server(
         "list_knowledge_documents",
         (
             f"List every document in the attached knowledge base(s): {display}. "
-            "Returns file_id, filename, and size for each. Use before "
-            "read_knowledge_document or grep_knowledge when you need to know "
-            "what's there."
+            "Returns file_id, filename, and size for each."
         ),
         {},
     )
-    async def _list_docs(args: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG001
+    async def _list_docs(args: Dict[str, Any]) -> Dict[str, Any]:
         if not kb_ids:
             return {
                 "content": [
@@ -577,12 +584,8 @@ def _build_kb_mcp_server(
     @tool(
         "read_knowledge_document",
         (
-            "Read the full content of a knowledge document (or a character "
-            "range of it) by file_id. Use to zoom into a doc that "
-            "search_knowledge found, or read it top-to-bottom if small. "
-            "Omit start_char/end_char to read the whole file. "
-            "Each call caps at 40 000 chars; page using start_char/end_char "
-            "if the file is larger."
+            "Read the full content of a knowledge document (or a character range of it) by file_id. "
+            "Omit start_char/end_char to read the whole file. Each call caps at 40 000 chars."
         ),
         {"file_id": str, "start_char": int, "end_char": int},
     )
@@ -602,20 +605,17 @@ def _build_kb_mcp_server(
                     }
                 ]
             }
-
         try:
             file_obj = Files.get_file_by_id(file_id)
         except Exception as exc:
             return {"content": [{"type": "text", "text": f"Lookup failed: {exc}"}]}
         if file_obj is None:
             return {"content": [{"type": "text", "text": "File not found."}]}
-
         content = (file_obj.data or {}).get("content", "") or ""
         total = len(content)
         start = max(0, int(args.get("start_char") or 0))
         raw_end = args.get("end_char")
         end = total if raw_end in (None, 0) else min(total, max(start, int(raw_end)))
-        # Hard cap per call to avoid flooding the context window.
         MAX_CHARS = 40_000
         if end - start > MAX_CHARS:
             end = start + MAX_CHARS
@@ -630,25 +630,10 @@ def _build_kb_mcp_server(
     @tool(
         "grep_knowledge",
         (
-            "Regex/substring search across knowledge documents. Runs against "
-            "pre-extracted plain text in the database (no PDF re-parsing), "
-            "so it's fast. Use for exact keywords, product codes, "
-            "acronyms where vector search struggles.\n\n"
-            "- `pattern` (required): regex or literal string\n"
-            "- `file_id` (optional): if set, grep only that file; omit or "
-            "leave empty to grep the whole knowledge base\n"
-            "- `case_insensitive` (default true)\n"
-            "- `max_matches` (default 30)\n\n"
-            "Returns each hit with 80 chars of surrounding context, the "
-            "source filename, and the char offset — use that offset with "
-            "read_knowledge_document to fetch more context."
+            "Regex/substring search across knowledge documents. Fast (runs on pre-extracted text in the DB). "
+            "Use for exact keywords, product codes, acronyms where vector search struggles."
         ),
-        {
-            "pattern": str,
-            "file_id": str,
-            "case_insensitive": bool,
-            "max_matches": int,
-        },
+        {"pattern": str, "file_id": str, "case_insensitive": bool, "max_matches": int},
     )
     async def _grep(args: Dict[str, Any]) -> Dict[str, Any]:
         pattern = str(args.get("pattern") or "")
@@ -661,7 +646,6 @@ def _build_kb_mcp_server(
             compiled = re.compile(pattern, flags)
         except re.error as exc:
             return {"content": [{"type": "text", "text": f"Invalid regex: {exc}"}]}
-
         if file_id_filter:
             allowed = await _allowed_file_ids()
             if file_id_filter not in allowed:
@@ -673,7 +657,6 @@ def _build_kb_mcp_server(
                         }
                     ]
                 }
-
         hits: List[str] = []
         files_scanned = 0
         async for f in _iter_scoped_files():
@@ -692,7 +675,6 @@ def _build_kb_mcp_server(
                     break
             if len(hits) >= max_matches:
                 break
-
         scope = (
             f"1 file ({file_id_filter})"
             if file_id_filter
@@ -707,10 +689,7 @@ def _build_kb_mcp_server(
                     }
                 ]
             }
-        header = (
-            f"Found {len(hits)} match(es) for /{pattern}/ across {scope}"
-            f"{' (capped at max_matches)' if len(hits) >= max_matches else ''}:\n"
-        )
+        header = f"Found {len(hits)} match(es) for /{pattern}/ across {scope}{' (capped at max_matches)' if len(hits) >= max_matches else ''}:\n"
         return {"content": [{"type": "text", "text": header + "\n".join(hits)}]}
 
     tools_list = [_search]
@@ -740,9 +719,6 @@ def _build_kb_mcp_server(
 def _anthropic_kb_tool_defs(
     knowledge: List[Dict[str, str]], has_kb_ids: bool
 ) -> List[Dict[str, Any]]:
-    """JSON-Schema tool definitions for the Anthropic Messages API. Kept
-    in sync with `_build_kb_mcp_server`'s tools (same names & input fields)
-    so Claude sees an identical toolbox regardless of which path is active."""
     if not knowledge:
         return []
     display = ", ".join(k["name"] for k in knowledge)
@@ -770,20 +746,12 @@ def _anthropic_kb_tool_defs(
             [
                 {
                     "name": "list_knowledge_documents",
-                    "description": (
-                        f"List every document in {display}. "
-                        "Returns file_id, filename, and size for each."
-                    ),
+                    "description": f"List every document in {display}. Returns file_id, filename, and size for each.",
                     "input_schema": {"type": "object", "properties": {}},
                 },
                 {
                     "name": "read_knowledge_document",
-                    "description": (
-                        "Read full content (or a character range) of a "
-                        "knowledge document by file_id. Omit start_char / "
-                        "end_char to read the whole file. Caps at 40 000 "
-                        "chars per call — page using start_char to continue."
-                    ),
+                    "description": "Read full content (or a character range) of a knowledge document by file_id. Caps at 40 000 chars per call.",
                     "input_schema": {
                         "type": "object",
                         "properties": {
@@ -796,12 +764,7 @@ def _anthropic_kb_tool_defs(
                 },
                 {
                     "name": "grep_knowledge",
-                    "description": (
-                        "Regex/substring search across knowledge documents. "
-                        "Fast (runs on pre-extracted text in the DB). Use for "
-                        "exact keywords, product codes, acronyms where vector "
-                        "search struggles."
-                    ),
+                    "description": "Regex/substring search across knowledge documents. Fast (runs on pre-extracted text in the DB).",
                     "input_schema": {
                         "type": "object",
                         "properties": {
@@ -823,8 +786,6 @@ async def _dispatch_kb_tool(
     args: Dict[str, Any],
     tools_by_name: Dict[str, Any],
 ) -> str:
-    """Call a KB tool by name and unwrap its MCP-format result into plain
-    text suitable for returning as an Anthropic tool_result content block."""
     sdk_tool = tools_by_name.get(name)
     if sdk_tool is None:
         return f"Unknown tool: {name}"
@@ -839,66 +800,6 @@ async def _dispatch_kb_tool(
         if isinstance(first, dict):
             return first.get("text", "")
     return ""
-
-
-# ---------------------------------------------------------------------------
-# Fast-path gate: decide whether a turn needs the full Claude Code agent loop
-# (CLI + MCP + tool-use deliberation, ~3–5 s overhead) or can ride the cheap
-# Messages-API path (~300 ms – 2 s). Same model on both sides — the split is
-# about mode, not model.
-# ---------------------------------------------------------------------------
-
-_AGENT_PATTERN = re.compile(
-    r"\b("
-    r"plot|chart|graph|pdf|"
-    r"create\s+(a\s+)?file|save\s+(to\s+|as\s+)?(a\s+)?file|"
-    r"generate\s+(a\s+)?(pdf|file|chart|plot|image|report)|"
-    r"run\s+(this\s+)?(code|script|command|bash|python)|"
-    r"execute\s+(code|script|this|the)|"
-    r"download|fetch\s+(from|url|the\s+url)|"
-    r"analyze\s+(the\s+|this\s+)?(file|doc|document|csv|spreadsheet|data)|"
-    r"read\s+(the\s+|this\s+)?(file|doc|document)|"
-    r"write\s+(to\s+)?(a\s+)?file|edit\s+\S+\.\w+|"
-    r"make\s+(a\s+|me\s+a\s+)?(plot|chart|pdf|graph|visualization|viz)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Mentioning a file extension is a strong "the user has / wants a file" signal.
-_FILE_EXT_PATTERN = re.compile(
-    r"\.(pdf|csv|tsv|xlsx|xls|docx|pptx|png|jpe?g|svg|html?|json|md|ipynb|zip|tar\.gz)\b",
-    re.IGNORECASE,
-)
-
-_MODE_PREFIXES = ("/agent", "/fast")
-
-
-def _strip_mode_prefix(prompt: str) -> str:
-    stripped = prompt.lstrip()
-    for tag in _MODE_PREFIXES:
-        if stripped.startswith(tag):
-            return stripped[len(tag) :].lstrip()
-    return prompt
-
-
-def _needs_agent(prompt: str, files: Optional[List[Any]]) -> bool:
-    """Route-per-turn heuristic. `/agent` / `/fast` prefixes are explicit
-    overrides. Attachments force agent mode (the model should be able to
-    read them). Otherwise: look for keywords and file-extension mentions."""
-    if not prompt:
-        return False
-    stripped = prompt.lstrip()
-    if stripped.startswith("/agent"):
-        return True
-    if stripped.startswith("/fast"):
-        return False
-    if files:
-        return True
-    if _AGENT_PATTERN.search(stripped):
-        return True
-    if _FILE_EXT_PATTERN.search(stripped):
-        return True
-    return False
 
 
 def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
@@ -920,6 +821,17 @@ def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
     return ""
 
 
+_MODE_PREFIXES = ("/agent", "/fast")
+
+
+def _strip_mode_prefix(prompt: str) -> str:
+    stripped = prompt.lstrip()
+    for tag in _MODE_PREFIXES:
+        if stripped.startswith(tag):
+            return stripped[len(tag) :].lstrip()
+    return prompt
+
+
 class Pipe:
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(
@@ -937,9 +849,9 @@ class Pipe:
                 "don't re-offer subscription auth to end users."
             ),
         )
-        MODEL: str = Field(
-            default="claude-haiku-4-5",
-            description="Claude model ID (e.g. claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-7).",
+        MODELS: str = Field(
+            default="claude-haiku-4-5:Haiku,claude-sonnet-4-6:Sonnet",
+            description="Comma-separated list of models in format model_id:DisplayName",
         )
         PERMISSION_MODE: str = Field(
             default="bypassPermissions",
@@ -953,6 +865,10 @@ class Pipe:
             default="/tmp/claude-agent-pipe",
             description="Root directory for per-chat workspaces. One subdir per chat_id.",
         )
+        CLAUDE_MD_TEMPLATE: str = Field(
+            default="",
+            description="Path to a CLAUDE.md template file to copy into each new project directory. Example: /home/your_dir/claude_template/CLAUDE.md",
+        )
         MAX_TURNS: int = Field(
             default=30,
             description="Maximum agent turns per user message. 0 disables the cap.",
@@ -960,38 +876,32 @@ class Pipe:
 
     def __init__(self) -> None:
         self.valves = self.Valves()
+        self._current_model: str = ""
+
+    @property
+    def _model(self) -> str:
+        """Текущая модель — берётся из _current_model или первой записи MODELS."""
+        if self._current_model:
+            return self._current_model
+        first = self.valves.MODELS.split(",")[0].strip()
+        model_id = first.split(":")[0].strip() if ":" in first else first
+        return model_id
 
     def pipes(self) -> List[Dict[str, str]]:
-        return [{"id": "claude-code", "name": "Claude Code"}]
-
-    async def _run_fast(
-        self,
-        body: Dict[str, Any],
-        user_dict: Optional[Dict[str, Any]],
-        metadata: Optional[Dict[str, Any]],
-        files: Optional[List[Dict[str, Any]]],
-        event_emitter: Optional[Callable],
-    ) -> AsyncGenerator[str, None]:
-        """Dispatcher. Pick the cheapest available fast path:
-        1. API key available → direct Messages API (~300 ms – 2 s).
-        2. OAuth token only → "lite agent": ClaudeSDKClient with no tools,
-           no MCP, plain system prompt (~2–3 s; CLI cold-start is
-           unavoidable because Anthropic's Messages API rejects OAuth tokens
-           — the subscription only works via the Claude Code backend).
-        """
-        has_api_key = bool(
-            self.valves.ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY")
-        )
-        if has_api_key:
-            async for chunk in self._run_messages_api(
-                body, user_dict, metadata, files, event_emitter
-            ):
-                yield chunk
-        else:
-            async for chunk in self._run_lite_agent(
-                body, user_dict, metadata, files, event_emitter
-            ):
-                yield chunk
+        result = []
+        for entry in self.valves.MODELS.split(","):
+            entry = entry.strip()
+            if ":" in entry:
+                model_id, display = entry.split(":", 1)
+            else:
+                model_id, display = entry, entry
+            result.append(
+                {
+                    "id": f"claude-code-{model_id.strip()}",
+                    "name": f"Claude Code ({display.strip()})",
+                }
+            )
+        return result
 
     async def _run_messages_api(
         self,
@@ -1001,11 +911,6 @@ class Pipe:
         files: Optional[List[Dict[str, Any]]],
         event_emitter: Optional[Callable],
     ) -> AsyncGenerator[str, None]:
-        """Direct Anthropic Messages-API streaming with optional agentic KB
-        tool use. No CLI cold start, no Claude Code persona. If a Workspace
-        Model has a knowledge base attached, Claude gets the same KB tools
-        as the full agent (search / list / read / grep) and can reformulate
-        queries in a native tool-use loop."""
         try:
             from anthropic import AsyncAnthropic
         except ImportError:
@@ -1023,11 +928,6 @@ class Pipe:
             system_parts.append(ws_system)
         system = "\n\n".join(p for p in system_parts if p.strip()) or None
 
-        # Build KB tools if a workspace knowledge base is attached. Both the
-        # MCP server's tool handlers and the Anthropic tool defs come from
-        # the same underlying closures (via _build_kb_mcp_server's 3rd
-        # return), so Claude sees an identical toolbox in either fast or
-        # agent mode.
         knowledge = _knowledge_collections(metadata, files)
         kb_row_ids = _knowledge_row_ids(metadata)
         _, _, kb_tools_by_name = _build_kb_mcp_server(
@@ -1038,8 +938,6 @@ class Pipe:
         )
         tool_defs = _anthropic_kb_tool_defs(knowledge, bool(kb_row_ids))
 
-        # Conversation: user/assistant only. Strip any `/agent` or `/fast`
-        # prefix from user turns so the model doesn't see it as content.
         messages: List[Dict[str, Any]] = []
         for msg in body.get("messages") or []:
             role = msg.get("role")
@@ -1071,14 +969,10 @@ class Pipe:
             except Exception:
                 pass
 
-        # Agentic tool-use loop. Stream text as it arrives; if Claude stops
-        # with stop_reason="tool_use", execute the tool(s), append the
-        # tool_result content blocks, and loop. Cap iterations so a runaway
-        # loop can't pin the event loop.
         MAX_TOOL_ROUNDS = 10
         for _round in range(MAX_TOOL_ROUNDS + 1):
             kwargs: Dict[str, Any] = {
-                "model": self.valves.MODEL,
+                "model": self._model,
                 "max_tokens": 4096,
                 "messages": messages,
             }
@@ -1094,16 +988,12 @@ class Pipe:
                     final = await stream.get_final_message()
             except Exception as exc:
                 log.exception("Fast path failed")
-                yield (
-                    f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n"
-                )
+                yield f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n"
                 return
 
             if final.stop_reason != "tool_use":
-                return  # end_turn — we're done
+                return
 
-            # Serialise the assistant message (incl. tool_use blocks) back
-            # into the conversation, then resolve each tool call.
             assistant_content: List[Dict[str, Any]] = []
             for block in final.content:
                 bt = block.type
@@ -1139,8 +1029,6 @@ class Pipe:
                         )
                     except Exception:
                         pass
-                # Render a compact tool-use note so the user can see what
-                # Claude searched for.
                 summary = f"🔧 {block.name}" + (f" · {preview}" if preview else "")
                 yield (
                     "\n\n<details>\n"
@@ -1152,15 +1040,11 @@ class Pipe:
                     block.name, block.input or {}, kb_tools_by_name
                 )
                 tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": text,
-                    }
+                    {"type": "tool_result", "tool_use_id": block.id, "content": text}
                 )
             messages.append({"role": "user", "content": tool_results})
 
-        yield "\n\n_(Fast-path tool loop cap reached — switch to `/agent` for deeper research.)_\n"
+        yield "\n\n_(Fast-path tool loop cap reached.)_\n"
 
     async def _run_lite_agent(
         self,
@@ -1170,17 +1054,10 @@ class Pipe:
         files: Optional[List[Dict[str, Any]]],
         event_emitter: Optional[Callable],
     ) -> AsyncGenerator[str, None]:
-        """OAuth-compatible fast path: ClaudeSDKClient with KB tools only
-        (no Bash / Read / Write / Web / files). Pays the CLI cold-start
-        (~1–2 s) but skips the big agent persona. When a workspace knowledge
-        base is attached, Claude can agentically search / list / read / grep
-        it — query reformulation works here too."""
         prompt = _strip_mode_prefix(_extract_latest_user_prompt(body))
         if not prompt:
             return
 
-        # Workspace-Model system + prior conversation (ClaudeSDKClient.query
-        # takes a single string, so we pack history into the system).
         system_parts: List[str] = []
         ws_system = _extract_system_prompt(body)
         if ws_system:
@@ -1205,7 +1082,7 @@ class Pipe:
                 content = _strip_mode_prefix(content)
                 consumed += 1
                 if consumed == user_turns_remaining:
-                    continue  # skip the latest — it's the query itself
+                    continue
             if content.strip():
                 history_lines.append(f"{role.capitalize()}: {content.strip()}")
         if history_lines:
@@ -1213,7 +1090,6 @@ class Pipe:
                 "Prior conversation (for context):\n\n" + "\n\n".join(history_lines)
             )
 
-        # KB tools via the existing MCP server. No Bash/Read/Write/etc.
         knowledge = _knowledge_collections(metadata, files)
         kb_row_ids = _knowledge_row_ids(metadata)
         kb_server, kb_tool_names, _kb_dict = _build_kb_mcp_server(
@@ -1227,16 +1103,14 @@ class Pipe:
             system_parts.append(
                 "You have read-only knowledge-base tools ("
                 + ", ".join(t.rsplit("__", 1)[-1] for t in kb_tool_names)
-                + "). Use them when the user asks about facts that might be "
-                "in the knowledge base. Reformulate and search multiple times "
-                "if the first query misses."
+                + "). Use them when the user asks about facts that might be in the knowledge base."
             )
         else:
             system_parts.append("Respond concisely and directly.")
         system_text = "\n\n".join(p for p in system_parts if p.strip())
 
         options_kwargs: Dict[str, Any] = {
-            "model": self.valves.MODEL,
+            "model": self._model,
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": kb_tool_names,
             "setting_sources": [],
@@ -1252,10 +1126,7 @@ class Pipe:
                 await event_emitter(
                     {
                         "type": "status",
-                        "data": {
-                            "description": "⚡ fast mode (OAuth)",
-                            "done": False,
-                        },
+                        "data": {"description": "⚡ fast mode (OAuth)", "done": False},
                     }
                 )
             except Exception:
@@ -1275,6 +1146,7 @@ class Pipe:
                             block = ev.get("content_block") or {}
                             if block.get("type") == "thinking":
                                 thinking_buffers[ev.get("index", 0)] = ""
+                                yield "<thinking>"
                         elif etype == "content_block_delta":
                             delta = ev.get("delta") or {}
                             dt = delta.get("type")
@@ -1284,19 +1156,13 @@ class Pipe:
                                 idx = ev.get("index", 0)
                                 if idx in thinking_buffers:
                                     thinking_buffers[idx] += delta.get("thinking", "")
+                                    yield delta.get("thinking", "")
                         elif etype == "content_block_stop":
                             idx = ev.get("index", 0)
                             if idx in thinking_buffers:
-                                text = thinking_buffers.pop(idx).strip()
-                                if text:
-                                    yield (
-                                        "\n\n<details>\n"
-                                        "<summary>💭 Thinking</summary>\n\n"
-                                        f"{text}\n\n"
-                                        "</details>\n\n"
-                                    )
+                                thinking_buffers.pop(idx)
+                                yield "</thinking>"
                     elif isinstance(message, AssistantMessage):
-                        # Tool-use rendering (KB tools only here).
                         for block in message.content:
                             if isinstance(block, ToolUseBlock):
                                 preview = _tool_preview(block.name, block.input)
@@ -1310,8 +1176,6 @@ class Pipe:
                                     "</details>\n\n"
                                 )
                     elif isinstance(message, UserMessage):
-                        # Surface tool errors (quietly) so the user isn't
-                        # confused by Claude retrying silently.
                         content = message.content
                         if isinstance(content, list):
                             for block in content:
@@ -1322,7 +1186,7 @@ class Pipe:
                                     err_text = _format_tool_result(block.content)[:400]
                                     yield (
                                         "\n\n<details>\n<summary>"
-                                        "<sub>⚙️ tool hiccup</sub></summary>\n\n"
+                                        "⚙️ tool hiccup</summary>\n\n"
                                         f"```\n{err_text}\n```\n\n"
                                         "</details>\n\n"
                                     )
@@ -1341,44 +1205,50 @@ class Pipe:
         __user__: Optional[Dict[str, Any]] = None,
         __metadata__: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
-        # Auth selection:
-        #   1. If CLAUDE_CODE_OAUTH_TOKEN valve is set → use subscription.
-        #      Remove any ANTHROPIC_API_KEY from env because per Claude Code's
-        #      precedence order, the API key outranks the OAuth token (docs:
-        #      code.claude.com/docs/en/authentication#authentication-precedence)
-        #      and would otherwise silently win.
-        #   2. Else if ANTHROPIC_API_KEY valve is set → use API.
-        #   3. Else → whatever the backend environment already provides.
         if self.valves.CLAUDE_CODE_OAUTH_TOKEN:
             os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = self.valves.CLAUDE_CODE_OAUTH_TOKEN
             os.environ.pop("ANTHROPIC_API_KEY", None)
             os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
         elif self.valves.ANTHROPIC_API_KEY:
             os.environ["ANTHROPIC_API_KEY"] = self.valves.ANTHROPIC_API_KEY
-        # claude CLI refuses --dangerously-skip-permissions under root unless
-        # told it's inside a sandbox. OpenWebUI's backend runs as UID 0.
         os.environ.setdefault("IS_SANDBOX", "1")
+
+        # Определяем модель по выбранному pipe
+        selected = (body.get("model") or "").split(".")[-1]
+        if selected.startswith("claude-code-"):
+            self._current_model = selected[len("claude-code-") :]
+        else:
+            self._current_model = ""
 
         prompt = _extract_latest_user_prompt(body)
         if not prompt:
             yield "_No user message to send to Claude Code._"
             return
 
-        # Fast path disabled — always run the full agent loop.
         prompt = _strip_mode_prefix(prompt)
 
         chat_id = __chat_id__ or "default"
-        workdir = Path(self.valves.WORKDIR_ROOT) / chat_id
+        if chat_id not in _chat_workdirs:
+            name = await _emit_project_name(prompt, __event_emitter__)
+            if name == "Project":
+                name = f"Project_{chat_id[:6]}"
+            _chat_workdirs[chat_id] = name
+        workdir = Path(self.valves.WORKDIR_ROOT) / _chat_workdirs[chat_id]
         workdir.mkdir(parents=True, exist_ok=True)
+
+        if self.valves.CLAUDE_MD_TEMPLATE:
+            template = Path(self.valves.CLAUDE_MD_TEMPLATE)
+            claude_md = workdir / "CLAUDE.md"
+            if template.exists() and not claude_md.exists():
+                import shutil
+
+                shutil.copy2(template, claude_md)
 
         allowed_tools = [
             t.strip() for t in self.valves.ALLOWED_TOOLS.split(",") if t.strip()
         ]
         resume_id = _chat_sessions.get(chat_id)
 
-        # Knowledge base attached via Workspace Model → expose as an MCP tool
-        # Claude can call agentically. OpenWebUI's middleware already added one
-        # entry per attached KB to files/__files__.
         kb_server, kb_tool_names, _ = _build_kb_mcp_server(
             _knowledge_collections(__metadata__, __files__),
             knowledge_row_ids=_knowledge_row_ids(__metadata__),
@@ -1389,14 +1259,10 @@ class Pipe:
 
         options_kwargs: Dict[str, Any] = {
             "cwd": str(workdir),
-            "model": self.valves.MODEL,
+            "model": self._model,
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": allowed_tools,
-            # Don't load the host's ~/.claude/ or project .claude/ — OpenWebUI chats
-            # should run with an empty baseline, not inherit the backend user's config.
             "setting_sources": [],
-            # Stream token-level deltas so long answers type out instead of
-            # appearing as one chunk when the block finishes.
             "include_partial_messages": True,
         }
         if resume_id:
@@ -1406,16 +1272,18 @@ class Pipe:
         if kb_server is not None:
             options_kwargs["mcp_servers"] = {"helm-kb": kb_server}
 
-        # Extend Claude Code's default agent-loop system prompt with whatever
-        # the Workspace Model configured. `append` keeps the agentic prompt
-        # intact while adding domain persona/rules on top.
         system_prompt = _extract_system_prompt(body)
-        if system_prompt:
-            options_kwargs["system_prompt"] = {
-                "type": "preset",
-                "preset": "claude_code",
-                "append": system_prompt,
-            }
+        cwd_instruction = f"Always write files to the current working directory ({workdir}), never use /tmp or absolute paths like /root or /home unless explicitly asked."
+        append_text = (
+            f"{cwd_instruction}\n\n{system_prompt}"
+            if system_prompt
+            else cwd_instruction
+        )
+        options_kwargs["system_prompt"] = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": append_text,
+        }
 
         options = ClaudeAgentOptions(**options_kwargs)
 
@@ -1427,24 +1295,10 @@ class Pipe:
             )
 
         await emit_status("Starting Claude Code…")
-        # Claude often saves generated files to /tmp from habit (absolute paths
-        # in matplotlib/PIL examples), even though cwd is the chat workdir.
-        # Scan both so we don't miss the image.
-        scan_dirs = [workdir, Path("/tmp")]
+        scan_dirs = [workdir]
         artifact_snapshot = _snapshot_artifacts(scan_dirs)
 
-        # Buffer thinking deltas and emit the <details>…</details> wrapper as
-        # one atomic chunk at content_block_stop. Streaming the opener+content
-        # token-by-token is unreliable: CommonMark's HTML block terminates at
-        # blank lines, so thinking text with paragraph breaks strands the
-        # opening <details><summary> as literal text in some renderers. Reset
-        # at each message_start (indices restart per assistant message).
         thinking_buffers: Dict[int, str] = {}
-
-        # Heartbeat: when a tool starts, emit a status update every 5s showing
-        # elapsed time so the user sees that long-running commands (e.g. a 30s
-        # Bash) aren't stuck. Keyed by tool_use_id; completed tools removed on
-        # the matching ToolResultBlock.
         active_tools: Dict[str, Dict[str, Any]] = {}
         heartbeat_task: Optional[asyncio.Task] = None
 
@@ -1462,7 +1316,6 @@ class Pipe:
                         if count == 1
                         else f"{count} tools · longest {oldest['label']}"
                     )
-                    log.debug("heartbeat tick: %s · %ss", label, elapsed)
                     await emit_status(f"⏳ {label} · running {elapsed}s…")
             except asyncio.CancelledError:
                 pass
@@ -1492,7 +1345,7 @@ class Pipe:
                             block = ev.get("content_block") or {}
                             if block.get("type") == "thinking":
                                 thinking_buffers[ev.get("index", 0)] = ""
-                                await emit_status("💭 Thinking…")
+                                yield "<thinking>"
                         elif etype == "content_block_delta":
                             delta = ev.get("delta") or {}
                             dt = delta.get("type")
@@ -1502,24 +1355,15 @@ class Pipe:
                                 idx = ev.get("index", 0)
                                 if idx in thinking_buffers:
                                     thinking_buffers[idx] += delta.get("thinking", "")
-                            # signature_delta / input_json_delta: ignore. Tool input
-                            # is rendered once fully from AssistantMessage below.
+                                    yield delta.get("thinking", "")
                         elif etype == "content_block_stop":
                             idx = ev.get("index", 0)
                             if idx in thinking_buffers:
-                                text = thinking_buffers.pop(idx).strip()
-                                if text:
-                                    yield (
-                                        "\n\n<details>\n<summary>💭 Thinking</summary>\n\n"
-                                        f"{text}\n\n"
-                                        "</details>\n\n"
-                                    )
+                                thinking_buffers.pop(idx)
+                                yield "</thinking>"
                         continue
 
                     if isinstance(message, AssistantMessage):
-                        # Text + thinking already streamed via StreamEvent. Only
-                        # emit tool-use previews here (we need the completed
-                        # input dict, which StreamEvent only has as partial JSON).
                         for block in message.content:
                             if isinstance(block, ToolUseBlock):
                                 preview = _tool_preview(block.name, block.input)
@@ -1534,23 +1378,14 @@ class Pipe:
                                     "started": time.monotonic(),
                                 }
                                 _ensure_heartbeat()
-                                # Render as a collapsed <details>: summary is
-                                # plain text (OpenWebUI's sanitizer strips
-                                # inline HTML like <strong>/<code> inside
-                                # <summary> and renders the tags as literal
-                                # text); expanding reveals the full tool
-                                # input as a language-tagged fenced code block.
-                                # Don't html.escape here — OpenWebUI escapes
-                                # <summary> content itself, so pre-escaping
-                                # would double-encode ("&lt;" → "&amp;lt;").
                                 summary_text = f"🔧 {block.name}" + (
                                     f" · {preview}" if preview else ""
                                 )
-                                body = _tool_input_block(block.name, block.input)
+                                tool_body = _tool_input_block(block.name, block.input)
                                 yield (
                                     "\n\n<details>\n"
                                     f"<summary>{summary_text}</summary>\n\n"
-                                    f"{body}\n\n"
+                                    f"{tool_body}\n\n"
                                     "</details>\n\n"
                                 )
                         continue
@@ -1563,14 +1398,10 @@ class Pipe:
                             if isinstance(block, ToolResultBlock):
                                 active_tools.pop(block.tool_use_id, None)
                                 if block.is_error:
-                                    # Tool errors are usually transient — Claude
-                                    # retries and recovers. Render as a quiet,
-                                    # collapsed detail so the red icon / big
-                                    # traceback doesn't alarm users.
                                     err_text = _format_tool_result(block.content)[:800]
                                     yield (
                                         "\n\n<details>\n<summary>"
-                                        "<sub>⚙️ tool hiccup (retrying)</sub>"
+                                        "⚙️ tool hiccup (retrying)"
                                         "</summary>\n\n"
                                         f"```\n{err_text}\n```\n\n"
                                         "</details>\n\n"
@@ -1579,7 +1410,7 @@ class Pipe:
 
                     if isinstance(message, ResultMessage):
                         await emit_status("Done.", done=True)
-                        for chunk in _inline_new_artifacts(
+                        for chunk in await _inline_new_artifacts(
                             scan_dirs,
                             artifact_snapshot,
                             (__user__ or {}).get("id"),
