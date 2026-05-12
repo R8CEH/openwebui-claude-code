@@ -4,7 +4,7 @@ description: Run Claude Code's agent loop from inside OpenWebUI chats via the Cl
 author: Thomas Friedel, Denis Kutuzov (aka R8CEH)
 author_url: https://github.com/tfriedel/openwebui-claude-code
 funding_url: https://github.com/R8CEH/openwebui-claude-code
-version: 0.2.0
+version: 0.2.1
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -15,6 +15,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -94,37 +95,36 @@ _chat_workdirs: Dict[str, str] = {}
 
 
 async def _emit_project_name(prompt: str, event_emitter: Optional[Callable]) -> str:
-    """Извлекает название проекта из промпта или генерирует из ключевых слов."""
-    explicit = re.search(
-        r'(?:назов[её]м|название|named?|call(?:\s+it)?|project)\s+["\']?([A-Za-z0-9][A-Za-z0-9_\-]{1,30})["\']?',
+    """Extracts project name from prompt or generates from keywords."""
+    # First: look for versioned names like Calculator_v1.0 or My_Project_v2
+    version_match = re.search(
+        r"\b([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9\.]+)+)\b",
         prompt,
-        re.IGNORECASE,
     )
-    if explicit:
-        name = explicit.group(1)
+    if version_match:
+        name = version_match.group(1)
     else:
-        words = re.findall(r"[A-Za-z]{3,}", prompt)
-        meaningful = [
-            w.capitalize()
-            for w in words
-            if w.lower()
-            not in {
-                "the",
-                "and",
-                "for",
-                "with",
-                "from",
-                "that",
-                "this",
-                "let",
-                "make",
-                "create",
-                "write",
-                "simple",
-                "just",
-            }
-        ][:3]
-        name = "_".join(meaningful) or "Project"
+        # Second: look for explicit naming keywords
+        explicit = re.search(
+            r'(?:назов[её]м|название|named?|call(?:\s+it)?|project)\s+["\']?([A-Za-z0-9][A-Za-z0-9_\-]{1,30})["\']?',
+            prompt,
+            re.IGNORECASE,
+        )
+        if explicit:
+            name = explicit.group(1)
+        else:
+            # Fallback: generate from meaningful English words
+            words = re.findall(r"[A-Za-z]{3,}", prompt)
+            meaningful = [
+                w.capitalize()
+                for w in words
+                if w.lower()
+                not in {
+                    "the", "and", "for", "with", "from", "that", "this",
+                    "let", "make", "create", "write", "simple", "just",
+                }
+            ][:3]
+            name = "_".join(meaningful) or "Project"
 
     if event_emitter:
         try:
@@ -828,7 +828,7 @@ def _strip_mode_prefix(prompt: str) -> str:
     stripped = prompt.lstrip()
     for tag in _MODE_PREFIXES:
         if stripped.startswith(tag):
-            return stripped[len(tag) :].lstrip()
+            return stripped[len(tag):].lstrip()
     return prompt
 
 
@@ -861,13 +861,17 @@ class Pipe:
             default="Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch",
             description="Comma-separated tools auto-approved without prompting.",
         )
+        EFFORT: str = Field(
+            default="low",
+            description="Agent effort level: low, medium, high, xhigh, max. Controls thinking depth and token usage.",
+        )
         WORKDIR_ROOT: str = Field(
             default="/tmp/claude-agent-pipe",
-            description="Root directory for per-chat workspaces. One subdir per chat_id.",
+            description="Root directory for per-chat workspaces. One subdir per project name.",
         )
         CLAUDE_MD_TEMPLATE: str = Field(
             default="",
-            description="Path to a CLAUDE.md template file to copy into each new project directory. Example: /home/your_dir/claude_template/CLAUDE.md",
+            description="Path to a CLAUDE.md template file to copy into each new project directory. Example: /home/user/templates/CLAUDE.md",
         )
         MAX_TURNS: int = Field(
             default=30,
@@ -880,7 +884,7 @@ class Pipe:
 
     @property
     def _model(self) -> str:
-        """Текущая модель — берётся из _current_model или первой записи MODELS."""
+        """Current model — from _current_model or first entry in MODELS."""
         if self._current_model:
             return self._current_model
         first = self.valves.MODELS.split(",")[0].strip()
@@ -1213,10 +1217,10 @@ class Pipe:
             os.environ["ANTHROPIC_API_KEY"] = self.valves.ANTHROPIC_API_KEY
         os.environ.setdefault("IS_SANDBOX", "1")
 
-        # Определяем модель по выбранному pipe
+        # Determine model from selected pipe
         selected = (body.get("model") or "").split(".")[-1]
         if selected.startswith("claude-code-"):
-            self._current_model = selected[len("claude-code-") :]
+            self._current_model = selected[len("claude-code-"):]
         else:
             self._current_model = ""
 
@@ -1240,8 +1244,6 @@ class Pipe:
             template = Path(self.valves.CLAUDE_MD_TEMPLATE)
             claude_md = workdir / "CLAUDE.md"
             if template.exists() and not claude_md.exists():
-                import shutil
-
                 shutil.copy2(template, claude_md)
 
         allowed_tools = [
@@ -1269,6 +1271,8 @@ class Pipe:
             options_kwargs["resume"] = resume_id
         if self.valves.MAX_TURNS:
             options_kwargs["max_turns"] = self.valves.MAX_TURNS
+        if self.valves.EFFORT:
+            options_kwargs["effort"] = self.valves.EFFORT
         if kb_server is not None:
             options_kwargs["mcp_servers"] = {"helm-kb": kb_server}
 
